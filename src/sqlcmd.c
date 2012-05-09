@@ -1,0 +1,131 @@
+/*
+** This module contains the code that initializes the "sqlite3" command-line
+** shell against the repository database.  The command-line shell itself
+** is a copy of the "shell.c" code from SQLite.  This file contains logic
+** to initialize the code in shell.c.
+*/
+#include "config.h"
+#include "sqlcmd.h"
+#include <zlib.h>
+
+/*
+** Implementation of the "content(X)" SQL function.  Return the complete
+** content of artifact identified by X as a blob.
+*/
+static void sqlcmd_content(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  int rid;
+  Blob cx;
+  const char *zName;
+  assert( argc==1 );
+  zName = (const char*)sqlite3_value_text(argv[0]);
+  if( zName==0 ) return;
+  g.db = sqlite3_context_db_handle(context);
+  g.repositoryOpen = 1;
+  rid = name_to_rid(zName);
+  if( rid==0 ) return;
+  if( content_get(rid, &cx) ){
+    sqlite3_result_blob(context, blob_buffer(&cx), blob_size(&cx), 
+                                 SQLITE_TRANSIENT);
+    blob_reset(&cx);
+  }
+}
+
+/*
+** Implementation of the "compress(X)" SQL function.  The input X is
+** compressed using zLib and the output is returned.
+*/
+static void sqlcmd_compress(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const unsigned char *pIn;
+  unsigned char *pOut;
+  unsigned int nIn;
+  unsigned long int nOut;
+
+  pIn = sqlite3_value_blob(argv[0]);
+  nIn = sqlite3_value_bytes(argv[0]);
+  nOut = 13 + nIn + (nIn+999)/1000;
+  pOut = sqlite3_malloc( nOut+4 );
+  pOut[0] = nIn>>24 & 0xff;
+  pOut[1] = nIn>>16 & 0xff;
+  pOut[2] = nIn>>8 & 0xff;
+  pOut[3] = nIn & 0xff;
+  compress(&pOut[4], &nOut, pIn, nIn);
+  sqlite3_result_blob(context, pOut, nOut+4, sqlite3_free);
+}
+
+/*
+** Implementation of the "decompress(X)" SQL function.  The argument X
+** is a blob which was obtained from compress(Y).  The output will be
+** the value Y.
+*/
+static void sqlcmd_decompress(
+  sqlite3_context *context,
+  int argc,
+  sqlite3_value **argv
+){
+  const unsigned char *pIn;
+  unsigned char *pOut;
+  unsigned int nIn;
+  unsigned long int nOut;
+  int rc;
+
+  pIn = sqlite3_value_blob(argv[0]);
+  nIn = sqlite3_value_bytes(argv[0]);
+  nOut = (pIn[0]<<24) + (pIn[1]<<16) + (pIn[2]<<8) + pIn[3];
+  pOut = sqlite3_malloc( nOut+1 );
+  rc = uncompress(pOut, &nOut, &pIn[4], nIn-4);
+  if( rc==Z_OK ){
+    sqlite3_result_blob(context, pOut, nOut, sqlite3_free);
+  }else{
+    sqlite3_result_error(context, "input is not zlib compressed", -1);
+  }
+}
+
+/*
+** This is the "automatic extensionn" initializer that runs right after
+** the connection to the repository database is opened.  Set up the
+** database connection to be more useful to the human operator.
+*/
+static int sqlcmd_autoinit(
+  sqlite3 *db,
+  const char **pzErrMsg,
+  const void *notUsed
+){
+  sqlite3_create_function(db, "content", 1, SQLITE_ANY, 0,
+                          sqlcmd_content, 0, 0);
+  sqlite3_create_function(db, "compress", 1, SQLITE_ANY, 0,
+                          sqlcmd_compress, 0, 0);
+  sqlite3_create_function(db, "decompress", 1, SQLITE_ANY, 0,
+                          sqlcmd_decompress, 0, 0);
+  return SQLITE_OK;
+}
+
+
+/*
+** COMMAND: sqlite3
+**
+** Usage: %vcs sqlite3 ?DATABASE? ?OPTIONS?
+*/
+void sqlite3_cmd(void){
+  extern int sqlite3_shell(int, char**);
+  db_find_and_open_repository(OPEN_ANY_SCHEMA, 0);
+  db_close(1);
+  sqlite3_shutdown();
+  sqlite3_shell(g.argc-1, g.argv+1);
+}
+
+/*
+** This routine is called by the patched sqlite3 command-line shell in order
+** to load the name and database connection for the open vcs database.
+*/
+void vcs_open(const char **pzRepoName){
+  sqlite3_auto_extension((void(*)(void))sqlcmd_autoinit);
+  *pzRepoName = g.zRepositoryName;
+}
